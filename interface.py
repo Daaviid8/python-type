@@ -1,244 +1,175 @@
 import inspect
+import traceback
 from typing import Any, Dict, Type, get_type_hints
-from types import GenericAlias
 
-
-class TypedError(Exception):
-    """Excepción personalizada para errores de tipo"""
-    def __init__(self, message: str, field: str, expected_type: str, received_type: str, location: str):
-        self.field = field
+class TypedAttribute:
+    """
+    Descriptor que maneja la validación de tipos para atributos de clases Strict.
+    
+    Este descriptor se encarga de:
+    - Validar el tipo del valor al asignarlo
+    - Generar mensajes de error detallados con información de debugging
+    - Mantener el valor del atributo en el diccionario de la instancia
+    """
+    
+    def __init__(self, name: str, expected_type: Type, class_name: str):
+        self.name = name
         self.expected_type = expected_type
-        self.received_type = received_type
-        self.location = location
-        super().__init__(message)
+        self.class_name = class_name
+        self.private_name = f"__{name}"
+    
+    def __get__(self, instance, owner):
+        """Obtiene el valor del atributo."""
+        if instance is None:
+            return self
+        return getattr(instance, self.private_name, None)
+    
+    def __set__(self, instance, value):
+        """Establece el valor del atributo con validación de tipo."""
+        if not isinstance(value, self.expected_type):
+            frame = inspect.currentframe()
+            try:
+                caller_frame = frame.f_back
+                while caller_frame and self._is_internal_frame(caller_frame):
+                    caller_frame = caller_frame.f_back
+                if caller_frame:
+                    filename = caller_frame.f_code.co_filename
+                    line_number = caller_frame.f_lineno
+                else:
+                    filename = "unknown"
+                    line_number = "unknown"
+                error_msg = self._create_error_message(value, filename, line_number)
+                raise TypeError(error_msg)
+            finally:
+                del frame
+        setattr(instance, self.private_name, value)
+    
+    def _is_internal_frame(self, frame):
+        """Determina si un frame es interno de la implementación de Strict."""
+        code = frame.f_code
+        filename = code.co_filename
+        function_name = code.co_name
+        internal_functions = {'__init__', '__setattr__', '__set__', '_validate_kwargs','_create_error_message', '_is_internal_frame'}
+        return (function_name in internal_functions or 
+                'Strict' in str(frame.f_locals.get('self', '')))
+    
+    def _create_error_message(self, value, filename, line_number):
+        """Crea un mensaje de error detallado y legible."""
+        received_type = type(value).__name__
+        expected_type = self.expected_type.__name__
+        return f"""
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                                   TYPE ERROR                                         ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║ Class:     {self.class_name:<60} ║
+║ Attribute: {self.name:<60} ║
+║ File:      {filename:<60} ║
+║ Line:      {line_number:<60} ║
+║ Expected:  {expected_type:<60} ║
+║ Received:  {received_type:<60} ║
+║ Value:     {repr(value):<60} ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+        """.strip()
 
 
-class TypedMeta(type):
-    """Metaclase que gestiona la validación de tipos"""
+class StrictMeta(type):
+    """
+    Metaclase para la clase Strict que procesa las declaraciones de tipo.
+    
+    Esta metaclase:
+    - Identifica los atributos tipados en la definición de clase
+    - Crea descriptores TypedAttribute para cada atributo tipado
+    - Maneja la herencia de atributos tipados de clases base
+    - Almacena información de tipos para validación
+    """
     
     def __new__(mcs, name, bases, namespace, **kwargs):
-        # Obtener anotaciones de tipo
-        annotations = namespace.get('__annotations__', {})
-        
-        # Crear la clase
-        cls = super().__new__(mcs, name, bases, namespace)
-        
-        # Almacenar información de tipos
-        cls._typed_fields = annotations
-        cls._typed_required = set(annotations.keys())
-        
-        return cls
-    
-    def __call__(cls, *args, **kwargs):
-        """Crear instancia con validación de tipos"""
-        instance = super().__call__()
-        
-        # Obtener el frame de llamada para mostrar ubicación del error
-        frame = inspect.currentframe().f_back
-        location = f"{frame.f_code.co_filename}:{frame.f_lineno}"
-        
-        # Procesar argumentos posicionales
-        field_names = list(cls._typed_fields.keys())
-        for i, arg in enumerate(args):
-            if i < len(field_names):
-                field_name = field_names[i]
-                kwargs[field_name] = arg
-        
-        # Validar que se proporcionen todos los campos requeridos
-        missing_fields = cls._typed_required - set(kwargs.keys())
-        if missing_fields:
-            raise TypedError(
-                f"Campos requeridos faltantes: {', '.join(missing_fields)}",
-                field=', '.join(missing_fields),
-                expected_type="required",
-                received_type="missing",
-                location=location
-            )
-        
-        # Validar tipos y asignar valores
-        for field_name, value in kwargs.items():
-            if field_name in cls._typed_fields:
-                expected_type = cls._typed_fields[field_name]
-                cls._validate_and_set(instance, field_name, value, expected_type, location)
-        
-        return instance
-    
-    def _validate_and_set(cls, instance, field_name, value, expected_type, location):
-        """Validar tipo y asignar valor"""
-        if not cls._is_valid_type(value, expected_type):
-            raise TypedError(
-                f"Error de tipo en '{field_name}' en {location}:\n"
-                f"  Campo: {field_name}\n"
-                f"  Tipo esperado: {cls._format_type(expected_type)}\n"
-                f"  Tipo obtenido: {type(value).__name__}\n"
-                f"  Valor: {repr(value)}",
-                field=field_name,
-                expected_type=cls._format_type(expected_type),
-                received_type=type(value).__name__,
-                location=location
-            )
-        
-        # Asignar valor de forma inmutable
-        object.__setattr__(instance, field_name, value)
-    
-    def _is_valid_type(cls, value, expected_type):
-        """Verificar si el valor coincide con el tipo esperado"""
-        # Manejar tipos básicos
-        if expected_type in (int, str, float, bool, list, dict, tuple, set):
-            return isinstance(value, expected_type)
-        
-        # Manejar tipos genéricos (List, Dict, etc.)
-        if hasattr(expected_type, '__origin__'):
-            origin = expected_type.__origin__
-            if origin is list:
-                if not isinstance(value, list):
-                    return False
-                if hasattr(expected_type, '__args__') and expected_type.__args__:
-                    item_type = expected_type.__args__[0]
-                    return all(cls._is_valid_type(item, item_type) for item in value)
-                return True
-            elif origin is dict:
-                if not isinstance(value, dict):
-                    return False
-                if hasattr(expected_type, '__args__') and len(expected_type.__args__) == 2:
-                    key_type, value_type = expected_type.__args__
-                    return all(
-                        cls._is_valid_type(k, key_type) and cls._is_valid_type(v, value_type)
-                        for k, v in value.items()
-                    )
-                return True
-            elif origin is tuple:
-                if not isinstance(value, tuple):
-                    return False
-                if hasattr(expected_type, '__args__') and expected_type.__args__:
-                    if len(expected_type.__args__) == len(value):
-                        return all(
-                            cls._is_valid_type(v, t) 
-                            for v, t in zip(value, expected_type.__args__)
-                        )
-                return True
-        
-        # Manejar clases personalizadas
-        if inspect.isclass(expected_type):
-            return isinstance(value, expected_type)
-        
-        return False
-    
-    def _format_type(cls, type_hint):
-        """Formatear el tipo para mostrar en errores"""
-        if hasattr(type_hint, '__name__'):
-            return type_hint.__name__
-        return str(type_hint)
+        base_typed_attrs = {}
+        for base in bases:
+            if hasattr(base, '_typed_attributes'):
+                base_typed_attrs.update(base._typed_attributes)
+        typed_attrs = {}
+        for attr_name, attr_value in list(namespace.items()):
+            if isinstance(attr_value, type) and not attr_name.startswith('_'):
+                typed_attrs[attr_name] = attr_value
+                namespace[attr_name] = TypedAttribute(attr_name, attr_value, name)
+        all_typed_attrs = {**base_typed_attrs, **typed_attrs}
+        namespace['_typed_attributes'] = all_typed_attrs
+        return super().__new__(mcs, name, bases, namespace, **kwargs)
 
-
-class typed(metaclass=TypedMeta):
-    """Clase base para crear interfaces tipadas"""
+class Strict(metaclass=StrictMeta):
+    """
+    Clase base que permite definir clases con campos tipados al estilo TypeScript.
     
-    def __new__(cls, *args, **kwargs):
-        if cls is typed:
-            raise TypeError("No se puede instanciar 'typed' directamente")
-        return super().__new__(cls)
+    Características:
+    - Validación automática de tipos en la creación e instancia
+    - Mensajes de error detallados con información de debugging
+    - Soporte para herencia de tipos
+    - Constructor automático con argumentos de palabra clave
+    - Validación continua en asignaciones posteriores
+    
+    Ejemplo de uso:
+        class Persona(Strict):
+            name = str
+            age = int
+        
+        persona = Persona(name="Juan", age=30)  # OK
+        persona.age = "treinta"  # TypeError con detalles
+    """
+    
+    def __init__(self, **kwargs):
+        """
+        Constructor que valida y asigna los valores proporcionados.
+        
+        Args:
+            **kwargs: Argumentos de palabra clave con los valores para los atributos
+        
+        Raises:
+            TypeError: Si algún valor no coincide con el tipo esperado
+            ValueError: Si faltan atributos requeridos o se proporcionan atributos no declarados
+        """
+        self._validate_kwargs(kwargs)
+        for attr_name, value in kwargs.items():
+            setattr(self, attr_name, value)
+        missing_attrs = set(self._typed_attributes.keys()) - set(kwargs.keys())
+        if missing_attrs:
+            raise ValueError(f"Missing required attributes for {self.__class__.__name__}: " f"{', '.join(sorted(missing_attrs))}")
+    
+    def _validate_kwargs(self, kwargs):
+        """
+        Valida que los argumentos proporcionados sean válidos.
+        
+        Args:
+            kwargs: Diccionario de argumentos a validar
+        
+        Raises:
+            ValueError: Si se proporcionan atributos no declarados
+        """
+        unknown_attrs = set(kwargs.keys()) - set(self._typed_attributes.keys())
+        if unknown_attrs:
+            raise ValueError(f"Unknown attributes for {self.__class__.__name__}: " f"{', '.join(sorted(unknown_attrs))}. " f"Available attributes: {', '.join(sorted(self._typed_attributes.keys()))}")
     
     def __setattr__(self, name, value):
-        """Prevenir modificación después de la inicialización (inmutabilidad)"""
-        if hasattr(self, '_initialized') and self._initialized:
-            raise AttributeError(f"No se puede modificar '{name}': los objetos tipados son inmutables")
-        super().__setattr__(name, value)
-    
-    def __init__(self):
-        """Marcar como inicializado para inmutabilidad"""
-        object.__setattr__(self, '_initialized', True)
+        """
+        Intercepta la asignación de atributos para validar tipos.
+        
+        Args:
+            name: Nombre del atributo
+            value: Valor a asignar
+        """
+        if name.startswith('_'):
+            super().__setattr__(name, value)
+            return
+        if name in self._typed_attributes:
+            super().__setattr__(name, value)
+        else:
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'. " f"Available attributes: {', '.join(sorted(self._typed_attributes.keys()))}")
     
     def __repr__(self):
-        """Representación legible del objeto"""
-        fields = []
-        for field_name in self._typed_fields:
-            if hasattr(self, field_name):
-                value = getattr(self, field_name)
-                fields.append(f"{field_name}={repr(value)}")
-        return f"{self.__class__.__name__}({', '.join(fields)})"
-    
-    def __eq__(self, other):
-        """Comparación de igualdad"""
-        if not isinstance(other, self.__class__):
-            return False
-        return all(
-            getattr(self, field, None) == getattr(other, field, None)
-            for field in self._typed_fields
-        )
-    
-    def __hash__(self):
-        """Hash para usar en sets y como keys de dict"""
-        return hash(tuple(
-            getattr(self, field, None) for field in sorted(self._typed_fields.keys())
-        ))
-
-
-# Ejemplos de uso
-if __name__ == "__main__":
-    from typing import List, Dict
-    
-    # Ejemplo 1: Clase básica
-    class Objeto(typed):
-        id: int
-        name: str
-        active: bool
-    
-    # Ejemplo 2: Clase con tipos complejos
-    class Usuario(typed):
-        id: int
-        name: str
-        tags: List[str]
-        metadata: Dict[str, str]
-    
-    # Ejemplo 3: Clase con otros objetos tipados
-    class Producto(typed):
-        id: int
-        name: str
-        price: float
-        owner: Usuario
-    
-    print("=== Ejemplos de uso correcto ===")
-    
-    # Crear objetos válidos
-    obj1 = Objeto(1, "test", True)
-    print(f"obj1: {obj1}")
-    
-    obj2 = Objeto(id=2, name="test2", active=False)
-    print(f"obj2: {obj2}")
-    
-    user = Usuario(1, "Juan", ["admin", "user"], {"role": "admin"})
-    print(f"user: {user}")
-    
-    product = Producto(1, "Laptop", 999.99, user)
-    print(f"product: {product}")
-    
-    print("\n=== Ejemplos de errores ===")
-    
-    # Probar errores de tipo
-    try:
-        obj_bad = Objeto("string", "test", True)  # id debe ser int
-    except TypedError as e:
-        print(f"Error: {e}")
-    
-    try:
-        user_bad = Usuario(1, "Juan", "should_be_list", {})  # tags debe ser List[str]
-    except TypedError as e:
-        print(f"Error: {e}")
-    
-    try:
-        obj_missing = Objeto(1, "test")  # falta active
-    except TypedError as e:
-        print(f"Error: {e}")
-    
-    print("\n=== Prueba de inmutabilidad ===")
-    try:
-        obj1.id = 999  # Debería fallar
-    except AttributeError as e:
-        print(f"Error de inmutabilidad: {e}")
-    
-    print("\n=== Comparación y hash ===")
-    obj3 = Objeto(1, "test", True)
-    print(f"obj1 == obj3: {obj1 == obj3}")
-    print(f"hash(obj1): {hash(obj1)}")
-    print(f"obj1 in {{obj3}}: {obj1 in {obj3}}")
+        """Representación string de la instancia."""
+        attrs = []
+        for attr_name in self._typed_attributes:
+            value = getattr(self, attr_name, None)
+            if value is not None:
+                attrs.append(f"{attr_name}={repr(value)}")
+        return f"{self.__class__.__name__}({', '.join(attrs)})"
