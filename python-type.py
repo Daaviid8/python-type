@@ -1,6 +1,7 @@
 import inspect
 import sys
 import functools
+import asyncio
 from typing import Union, Dict, Any, Tuple, List, get_origin, get_args, Optional
 
 def validate_data(*, 
@@ -10,6 +11,7 @@ def validate_data(*,
                   **types_override):
     """
     Decorator for validating function parameters and return types.
+    Works with both synchronous and asynchronous functions.
     
     Args:
         strict: If True, validates all parameters with type hints.
@@ -26,6 +28,11 @@ def validate_data(*,
     def my_function(name: str, age: int, price: float) -> str:
         return f"{name} is {age} years old"
     
+    @validate_data()
+    async def async_function(name: str, age: int) -> str:
+        await asyncio.sleep(0.1)  # Simulate async operation
+        return f"{name} is {age} years old"
+    
     With override (overwrites specific type hints):
     @validate_data(age=(int, str))  # Allows int or str for age
     def my_function(name: str, age: int, price: float) -> str:
@@ -38,144 +45,198 @@ def validate_data(*,
     
     Without return validation:
     @validate_data(validate_return=False)
-    def sum_numbers(a: int, b: int) -> int:
+    async def sum_numbers(a: int, b: int) -> int:
         return a + b
     
     With custom types:
     @validate_data(custom_types={'email': str, 'age': int, 'active': bool})
-    def process_user(email, age, active):
+    async def process_user(email, age, active):
+        await asyncio.sleep(0.1)
         return f"User {email} processed"
     
     All options combined:
     @validate_data(strict=True, validate_return=True, 
                    custom_types={'base_price': float},
                    discount=(int, float))
-    def calculate_price(base_price: float, discount: int, tax: float) -> float:
+    async def calculate_price(base_price: float, discount: int, tax: float) -> float:
+        await asyncio.sleep(0.1)
         return base_price * (1 - discount/100) * (1 + tax/100)
     """
     def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # Get function signature and context info
-            sig = inspect.signature(func)
-            param_names = list(sig.parameters.keys())
-            frame = sys._getframe(1)
-            error_line = frame.f_lineno
-            file_path = frame.f_code.co_filename
-            errors = []
-            
-            # Validate that override parameters exist in function
-            _validate_override_parameters(sig, types_override, func.__name__)
-            
-            # Determine if it's a class method
-            is_class_method = len(args) > 0 and len(param_names) > 0 and param_names[0] in ['self', 'cls']
-            if is_class_method:
-                class_instance = args[0]
-                class_name = class_instance.__class__.__name__ if param_names[0] == 'self' else args[0].__name__
-                context = f"Method: {class_name}.{func.__name__}()"
-            else:
-                context = f"Function: {func.__name__}()"
-            
-            # Bind arguments to parameters
-            bound_args = sig.bind(*args, **kwargs)
-            bound_args.apply_defaults()
-            
-            # Build types to validate with priority: override > custom_types > type_hints
-            types_to_validate = {}
-            
-            # Add type hints if strict mode is enabled
-            if strict:
-                for param_name, param in sig.parameters.items():
-                    if param_name in ['self', 'cls']:
-                        continue
-                    types_from_annotation = _extract_types_from_annotation(param.annotation)
-                    if types_from_annotation:
-                        types_to_validate[param_name] = types_from_annotation
-            
-            # Add custom types (overrides type hints)
-            if custom_types:
-                for param_name, custom_type in custom_types.items():
-                    types_to_validate[param_name] = _normalize_types(custom_type)
-            
-            # Add override types (highest priority)
-            for param_name, override_types_param in types_override.items():
-                types_to_validate[param_name] = _normalize_types(override_types_param)
-            
-            # Validate parameters
+        # Check if function is async
+        is_async = asyncio.iscoroutinefunction(func)
+        
+        if is_async:
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                # Perform validation before calling async function
+                _validate_parameters(func, args, kwargs)
+                
+                # Execute async function
+                result = await func(*args, **kwargs)
+                
+                # Validate return type if requested
+                if validate_return:
+                    _validate_return_type(func, result)
+                
+                return result
+            return async_wrapper
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                # Perform validation before calling sync function
+                _validate_parameters(func, args, kwargs)
+                
+                # Execute sync function
+                result = func(*args, **kwargs)
+                
+                # Validate return type if requested
+                if validate_return:
+                    _validate_return_type(func, result)
+                
+                return result
+            return sync_wrapper
+    
+    def _validate_parameters(func, args, kwargs):
+        """Common parameter validation logic for both sync and async functions."""
+        # Get function signature and context info
+        sig = inspect.signature(func)
+        param_names = list(sig.parameters.keys())
+        frame = sys._getframe(2)  # Go up 2 frames to get the actual caller
+        error_line = frame.f_lineno
+        file_path = frame.f_code.co_filename
+        errors = []
+        
+        # Validate that override parameters exist in function
+        _validate_override_parameters(sig, types_override, func.__name__)
+        
+        # Determine if it's a class method
+        is_class_method = len(args) > 0 and len(param_names) > 0 and param_names[0] in ['self', 'cls']
+        if is_class_method:
+            class_instance = args[0]
+            class_name = class_instance.__class__.__name__ if param_names[0] == 'self' else args[0].__name__
+            context = f"Method: {class_name}.{func.__name__}()"
+        else:
+            context = f"Function: {func.__name__}()"
+        
+        # Add async indicator to context
+        if asyncio.iscoroutinefunction(func):
+            context += " [async]"
+        
+        # Bind arguments to parameters
+        bound_args = sig.bind(*args, **kwargs)
+        bound_args.apply_defaults()
+        
+        # Build types to validate with priority: override > custom_types > type_hints
+        types_to_validate = {}
+        
+        # Add type hints if strict mode is enabled
+        if strict:
             for param_name, param in sig.parameters.items():
                 if param_name in ['self', 'cls']:
                     continue
-                if param_name not in types_to_validate:
-                    continue
-                if param_name not in bound_args.arguments:
-                    continue
-                
-                expected_types = types_to_validate[param_name]
-                arg_value = bound_args.arguments[param_name]
-                
-                # Skip None values if None is in expected types
-                if arg_value is None and type(None) in expected_types:
-                    continue
-                
-                received_type = type(arg_value)
-                
-                if not _validate_complex_types(arg_value, expected_types):
-                    param_index = param_names.index(param_name)
-                    is_positional = param_index < len(args)
-                    object_detail = _create_object_detail(arg_value, received_type)
-                    expected_types_str = " | ".join([getattr(type_, '__name__', str(type_)) for type_ in expected_types])
-                    
-                    # Determine source of type requirement
-                    if param_name in types_override:
-                        type_source = "override"
-                    elif custom_types and param_name in custom_types:
-                        type_source = "custom_types"
-                    else:
-                        type_source = "type hint"
-                    
-                    error_info = {
-                        'type': 'positional' if is_positional else 'named',
-                        'name': param_name,
-                        'position': param_index + 1 if is_positional else None,
-                        'expected_type': expected_types_str,
-                        'received_type': received_type.__name__,
-                        'object_detail': object_detail,
-                        'type_source': type_source
-                    }
-                    errors.append(error_info)
+                types_from_annotation = _extract_types_from_annotation(param.annotation)
+                if types_from_annotation:
+                    types_to_validate[param_name] = types_from_annotation
+        
+        # Add custom types (overrides type hints)
+        if custom_types:
+            for param_name, custom_type in custom_types.items():
+                types_to_validate[param_name] = _normalize_types(custom_type)
+        
+        # Add override types (highest priority)
+        for param_name, override_types_param in types_override.items():
+            types_to_validate[param_name] = _normalize_types(override_types_param)
+        
+        # Validate parameters
+        for param_name, param in sig.parameters.items():
+            if param_name in ['self', 'cls']:
+                continue
+            if param_name not in types_to_validate:
+                continue
+            if param_name not in bound_args.arguments:
+                continue
             
-            # Raise validation errors if any
-            if errors:
-                error_msg = _create_optimized_error_message(errors, file_path, error_line, context)
+            expected_types = types_to_validate[param_name]
+            arg_value = bound_args.arguments[param_name]
+            
+            # Skip None values if None is in expected types
+            if arg_value is None and type(None) in expected_types:
+                continue
+            
+            received_type = type(arg_value)
+            
+            if not _validate_complex_types(arg_value, expected_types):
+                param_index = param_names.index(param_name)
+                is_positional = param_index < len(args)
+                object_detail = _create_object_detail(arg_value, received_type)
+                expected_types_str = " | ".join([getattr(type_, '__name__', str(type_)) for type_ in expected_types])
+                
+                # Determine source of type requirement
+                if param_name in types_override:
+                    type_source = "override"
+                elif custom_types and param_name in custom_types:
+                    type_source = "custom_types"
+                else:
+                    type_source = "type hint"
+                
+                error_info = {
+                    'type': 'positional' if is_positional else 'named',
+                    'name': param_name,
+                    'position': param_index + 1 if is_positional else None,
+                    'expected_type': expected_types_str,
+                    'received_type': received_type.__name__,
+                    'object_detail': object_detail,
+                    'type_source': type_source
+                }
+                errors.append(error_info)
+        
+        # Raise validation errors if any
+        if errors:
+            error_msg = _create_optimized_error_message(errors, file_path, error_line, context)
+            raise ValidationError(error_msg)
+    
+    def _validate_return_type(func, result):
+        """Common return type validation logic for both sync and async functions."""
+        sig = inspect.signature(func)
+        if sig.return_annotation != inspect.Signature.empty:
+            expected_return_type = sig.return_annotation
+            if not _validate_complex_types(result, (expected_return_type,)):
+                frame = sys._getframe(2)  # Go up 2 frames to get the actual caller
+                error_line = frame.f_lineno
+                file_path = frame.f_code.co_filename
+                
+                # Determine context
+                is_class_method = hasattr(func, '__self__')
+                if is_class_method:
+                    class_name = func.__self__.__class__.__name__
+                    context = f"Method: {class_name}.{func.__name__}()"
+                else:
+                    context = f"Function: {func.__name__}()"
+                
+                # Add async indicator to context
+                if asyncio.iscoroutinefunction(func):
+                    context += " [async]"
+                
+                error_msg = f"\n{'='*70}\n"
+                error_msg += f"RETURN TYPE VALIDATION ERROR\n"
+                error_msg += f"{'='*70}\n"
+                error_msg += f"📁 File: {file_path}\n"
+                error_msg += f"📍 Line: {error_line}\n"
+                error_msg += f"🔧 {context}\n"
+                error_msg += f"✅ Expected type: {getattr(expected_return_type, '__name__', str(expected_return_type))}\n"
+                error_msg += f"❌ Received type: {type(result).__name__}\n"
+                error_msg += f"📦 Value: {repr(result)}\n"
+                error_msg += f"{'='*70}"
                 raise ValidationError(error_msg)
-            
-            # Execute function
-            result = func(*args, **kwargs)
-            
-            # Validate return type if requested
-            if validate_return and sig.return_annotation != inspect.Signature.empty:
-                expected_return_type = sig.return_annotation
-                if not _validate_complex_types(result, (expected_return_type,)):
-                    error_msg = f"\n{'='*70}\n"
-                    error_msg += f"RETURN TYPE VALIDATION ERROR\n"
-                    error_msg += f"{'='*70}\n"
-                    error_msg += f"📁 File: {file_path}\n"
-                    error_msg += f"📍 Line: {error_line}\n"
-                    error_msg += f"🔧 {context}\n"
-                    error_msg += f"✅ Expected type: {getattr(expected_return_type, '__name__', str(expected_return_type))}\n"
-                    error_msg += f"❌ Received type: {type(result).__name__}\n"
-                    error_msg += f"📦 Value: {repr(result)}\n"
-                    error_msg += f"{'='*70}"
-                    raise ValidationError(error_msg)
-            
-            return result
-        return wrapper
+    
     return decorator
 
 # Convenience function for creating custom validators
 def create_validator(custom_types: Dict[str, Any], **kwargs):
     """
     Creates a custom validator with specific types.
+    Works with both synchronous and asynchronous functions.
     
     Args:
         custom_types: Dictionary with types to validate
@@ -197,6 +258,11 @@ def create_validator(custom_types: Dict[str, Any], **kwargs):
     def process_user(email, age, active):
         return f"User {email} processed"
     
+    @user_validator
+    async def async_process_user(email, age, active):
+        await asyncio.sleep(0.1)
+        return f"User {email} processed"
+    
     Create a validator with additional options:
     strict_validator = create_validator(
         {'price': float, 'quantity': int},
@@ -205,7 +271,8 @@ def create_validator(custom_types: Dict[str, Any], **kwargs):
     )
     
     @strict_validator
-    def calculate_total(price, quantity):
+    async def calculate_total(price, quantity):
+        await asyncio.sleep(0.1)
         return price * quantity
     """
     return validate_data(custom_types=custom_types, **kwargs)
@@ -302,7 +369,6 @@ def _create_optimized_error_message(errors, file_path, error_line, context):
         error_msg += f"   ✅ Expected: {error['expected_type']} (from {error['type_source']})\n"
         error_msg += f"   ❌ Received: {error['received_type']}\n"
         error_msg += f"   📦 Value: {error['object_detail']}\n"
-    
     error_msg += f"\n{'='*70}"
     return error_msg
 
@@ -311,15 +377,12 @@ def _validate_complex_types(arg_value, expected_types):
     for expected_type in expected_types:
         origin = get_origin(expected_type)
         args = get_args(expected_type)
-        
         if origin is None:
             if isinstance(arg_value, expected_type):
                 return True
             continue
-        
         if not isinstance(arg_value, origin):
             continue
-        
         if origin is list and args:
             if all(isinstance(item, args[0]) for item in arg_value):
                 return True
@@ -341,5 +404,4 @@ def _validate_complex_types(arg_value, expected_types):
         else:
             if isinstance(arg_value, origin):
                 return True
-    
     return False
