@@ -5,6 +5,9 @@ import inspect
 import functools
 import asyncio
 from dataclasses import dataclass, fields, is_dataclass
+import json
+from datetime import datetime, date
+from decimal import Decimal
 
 class TypeConversionError(Exception):
     """Custom exception for type conversion errors"""
@@ -139,12 +142,6 @@ def to_set_of(obj: Any, element_type: Type) -> set:
     else:
         from typing import Set
         return check_type(obj, Set[element_type])
-
-import json
-import inspect
-from typing import Type, Any, Dict, List, Union
-from datetime import datetime, date
-from decimal import Decimal
 
 class TypedAttribute:
     """
