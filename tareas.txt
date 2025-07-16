@@ -1,11 +1,5 @@
-1. Agregar soporte para dataclass
-2. Mejorar el sistema de plugins
-3. Validación condicional: Validar tipos según condiciones
-4. Tipos personalizados: Sistema de plugins para tipos custom
-5. Serialización: Convertir objetos Strict a JSON/YAML automáticamente
-6. Integración con Pydantic: Compatibilidad con modelos Pydantic existentes
-7. Validación lazy: Validar solo cuando se accede al atributo
-8. Pre-compilar validadores para tipos complejos
-9. Validación en batch
-10. Crear un sistema de backends (rápido/completo/debug)
-11. Agregar soporte para validación distribuida
+1. Serialización: Convertir objetos Strict a JSON/YAML automáticamente
+2. Integración con Pydantic: Compatibilidad con modelos Pydantic existentes
+3. Validación lazy: Validar solo cuando se accede al atributo
+4. Pre-compilar validadores para tipos complejos
+5. Validación en batch
