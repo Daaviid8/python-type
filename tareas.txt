@@ -1,3 +1,1 @@
-2. Integración con Pydantic: Compatibilidad con modelos Pydantic existentes
-3. Validación lazy: Validar solo cuando se accede al atributo
-4. Pre-compilar validadores para tipos complejos
+Integración con Pydantic: Compatibilidad con modelos Pydantic existentes
