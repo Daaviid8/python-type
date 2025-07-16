@@ -4,6 +4,7 @@ import sys
 import inspect
 import functools
 import asyncio
+from dataclasses import dataclass, fields, is_dataclass
 
 class TypeConversionError(Exception):
     """Custom exception for type conversion errors"""
@@ -38,8 +39,10 @@ def _convert_generic_type(obj: Any, target_type: Type) -> Any:
     """
     origin = get_origin(target_type)
     args = get_args(target_type)
+    
     if origin is None:
         return _convert_simple_type(obj, target_type)
+    
     if origin in (list, tuple, set):
         if not isinstance(obj, Iterable) or isinstance(obj, str):
             obj = [obj]
@@ -80,6 +83,7 @@ def _convert_simple_type(obj: Any, target_type: Type) -> Any:
             return converter(obj)
         except (ValueError, TypeError, AttributeError) as e:
             raise TypeConversionError(f"Cannot convert {type(obj).__name__} to {target_type.__name__}: {e}")
+    
     try:
         return target_type(obj)
     except (ValueError, TypeError, AttributeError) as e:
@@ -103,10 +107,13 @@ def check_type(obj: Any, target_type: Type, auto_convert: bool = True) -> Any:
     """
     if type(obj) is target_type:
         return obj
+    
     if not auto_convert:
         raise TypeConversionError(f"Object is {type(obj).__name__}, expected {target_type}")
+    
     if hasattr(target_type, '__origin__') or get_origin(target_type) is not None:
         return _convert_generic_type(obj, target_type)
+    
     return _convert_simple_type(obj, target_type)
 
 def to_list_of(obj: Any, element_type: Type) -> list:
@@ -136,25 +143,23 @@ def to_set_of(obj: Any, element_type: Type) -> set:
 class TypedAttribute:
     """
     Descriptor que maneja la validación de tipos para atributos de clases Strict.
-    
     Este descriptor se encarga de:
     - Validar el tipo del valor al asignarlo
     - Generar mensajes de error detallados con información de debugging
     - Mantener el valor del atributo en el diccionario de la instancia
     """
-    
     def __init__(self, name: str, expected_type: Type, class_name: str):
         self.name = name
         self.expected_type = expected_type
         self.class_name = class_name
         self.private_name = f"__{name}"
-    
+
     def __get__(self, instance, owner):
         """Obtiene el valor del atributo."""
         if instance is None:
             return self
         return getattr(instance, self.private_name, None)
-    
+
     def __set__(self, instance, value):
         """Establece el valor del atributo con validación de tipo."""
         if not isinstance(value, self.expected_type):
@@ -163,74 +168,80 @@ class TypedAttribute:
                 caller_frame = frame.f_back
                 while caller_frame and self._is_internal_frame(caller_frame):
                     caller_frame = caller_frame.f_back
+                
                 if caller_frame:
                     filename = caller_frame.f_code.co_filename
                     line_number = caller_frame.f_lineno
                 else:
                     filename = "unknown"
                     line_number = "unknown"
+                
                 error_msg = self._create_error_message(value, filename, line_number)
                 raise TypeError(error_msg)
             finally:
                 del frame
+        
         setattr(instance, self.private_name, value)
-    
+
     def _is_internal_frame(self, frame):
         """Determina si un frame es interno de la implementación de Strict."""
         code = frame.f_code
         filename = code.co_filename
         function_name = code.co_name
-        internal_functions = {'__init__', '__setattr__', '__set__', '_validate_kwargs','_create_error_message', '_is_internal_frame'}
-        return (function_name in internal_functions or 'Strict' in str(frame.f_locals.get('self', '')))
-    
+        
+        internal_functions = {
+            '__init__', '__setattr__', '__set__', '_validate_kwargs',
+            '_create_error_message', '_is_internal_frame'
+        }
+        
+        return (function_name in internal_functions or 
+                'Strict' in str(frame.f_locals.get('self', '')))
+
     def _create_error_message(self, value, filename, line_number):
         """Crea un mensaje de error detallado y legible."""
         received_type = type(value).__name__
         expected_type = self.expected_type.__name__
-        return f"""
-╔══════════════════════════════════════════════════════════════════════════════════════╗
-║                                   TYPE ERROR                                         ║
-╠══════════════════════════════════════════════════════════════════════════════════════╣
-║ Class:     {self.class_name:<60} ║
-║ Attribute: {self.name:<60} ║
-║ File:      {filename:<60} ║
-║ Line:      {line_number:<60} ║
-║ Expected:  {expected_type:<60} ║
-║ Received:  {received_type:<60} ║
-║ Value:     {repr(value):<60} ║
-╚══════════════════════════════════════════════════════════════════════════════════════╝
-        """.strip()
-
+        
+        return f"""Class:     {self.class_name}
+Attribute: {self.name}
+File:      {filename}
+Line:      {line_number}
+Expected:  {expected_type}
+Received:  {received_type}
+Value:     {repr(value)}""".strip()
 
 class StrictMeta(type):
     """
     Metaclase para la clase Strict que procesa las declaraciones de tipo.
-    
     Esta metaclase:
     - Identifica los atributos tipados en la definición de clase
     - Crea descriptores TypedAttribute para cada atributo tipado
     - Maneja la herencia de atributos tipados de clases base
     - Almacena información de tipos para validación
     """
-    
     def __new__(mcs, name, bases, namespace, **kwargs):
+        # Recopilar atributos tipados de clases base
         base_typed_attrs = {}
         for base in bases:
             if hasattr(base, '_typed_attributes'):
                 base_typed_attrs.update(base._typed_attributes)
+        
+        # Identificar atributos tipados en la clase actual
         typed_attrs = {}
         for attr_name, attr_value in list(namespace.items()):
             if isinstance(attr_value, type) and not attr_name.startswith('_'):
                 typed_attrs[attr_name] = attr_value
                 namespace[attr_name] = TypedAttribute(attr_name, attr_value, name)
+        
+        # Combinar atributos tipados
         all_typed_attrs = {**base_typed_attrs, **typed_attrs}
         namespace['_typed_attributes'] = all_typed_attrs
+        
         return super().__new__(mcs, name, bases, namespace, **kwargs)
 
 class Strict(metaclass=StrictMeta):
     """
     Clase base que permite definir clases con campos tipados al estilo TypeScript.
-    
     Características:
     - Validación automática de tipos en la creación e instancia
     - Mensajes de error detallados con información de debugging
@@ -246,7 +257,6 @@ class Strict(metaclass=StrictMeta):
         persona = Persona(name="Juan", age=30)  # OK
         persona.age = "treinta"  # TypeError con detalles
     """
-    
     def __init__(self, **kwargs):
         """
         Constructor que valida y asigna los valores proporcionados.
@@ -259,12 +269,16 @@ class Strict(metaclass=StrictMeta):
             ValueError: Si faltan atributos requeridos o se proporcionan atributos no declarados
         """
         self._validate_kwargs(kwargs)
+        
         for attr_name, value in kwargs.items():
             setattr(self, attr_name, value)
+        
+        # Verificar que todos los atributos requeridos estén presentes
         missing_attrs = set(self._typed_attributes.keys()) - set(kwargs.keys())
         if missing_attrs:
-            raise ValueError(f"Missing required attributes for {self.__class__.__name__}: " f"{', '.join(sorted(missing_attrs))}")
-    
+            raise ValueError(f"Missing required attributes for {self.__class__.__name__}: "
+                           f"{', '.join(sorted(missing_attrs))}")
+
     def _validate_kwargs(self, kwargs):
         """
         Valida que los argumentos proporcionados sean válidos.
@@ -277,8 +291,10 @@ class Strict(metaclass=StrictMeta):
         """
         unknown_attrs = set(kwargs.keys()) - set(self._typed_attributes.keys())
         if unknown_attrs:
-            raise ValueError(f"Unknown attributes for {self.__class__.__name__}: " f"{', '.join(sorted(unknown_attrs))}. " f"Available attributes: {', '.join(sorted(self._typed_attributes.keys()))}")
-    
+            raise ValueError(f"Unknown attributes for {self.__class__.__name__}: "
+                           f"{', '.join(sorted(unknown_attrs))}. "
+                           f"Available attributes: {', '.join(sorted(self._typed_attributes.keys()))}")
+
     def __setattr__(self, name, value):
         """
         Intercepta la asignación de atributos para validar tipos.
@@ -290,11 +306,13 @@ class Strict(metaclass=StrictMeta):
         if name.startswith('_'):
             super().__setattr__(name, value)
             return
+        
         if name in self._typed_attributes:
             super().__setattr__(name, value)
         else:
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'. " f"Available attributes: {', '.join(sorted(self._typed_attributes.keys()))}")
-    
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'. "
+                               f"Available attributes: {', '.join(sorted(self._typed_attributes.keys()))}")
+
     def __repr__(self):
         """Representación string de la instancia."""
         attrs = []
@@ -304,7 +322,125 @@ class Strict(metaclass=StrictMeta):
                 attrs.append(f"{attr_name}={repr(value)}")
         return f"{self.__class__.__name__}({', '.join(attrs)})"
 
-def validate_data(*, strict: bool = True, validate_return: bool = True,custom_types: Optional[Dict[str, Any]] = None,**types_override):
+# NEW: Dataclass integration
+class DataclassValidationMixin:
+    """
+    Mixin que añade validación de tipos a dataclasses.
+    Se debe usar junto con @dataclass para obtener validación automática.
+    """
+    
+    def __post_init__(self):
+        """
+        Método llamado automáticamente por dataclass después de __init__.
+        Valida todos los campos del dataclass.
+        """
+        if hasattr(super(), '__post_init__'):
+            super().__post_init__()
+        
+        self._validate_dataclass_fields()
+    
+    def _validate_dataclass_fields(self):
+        """Valida todos los campos del dataclass."""
+        if not is_dataclass(self):
+            return
+        
+        for field in fields(self):
+            if field.name.startswith('_'):
+                continue
+            
+            value = getattr(self, field.name)
+            expected_type = field.type
+            
+            if not self._validate_field_type(value, expected_type, field.name):
+                frame = inspect.currentframe()
+                try:
+                    caller_frame = frame.f_back.f_back  # Skip __post_init__ and __init__
+                    filename = caller_frame.f_code.co_filename if caller_frame else "unknown"
+                    line_number = caller_frame.f_lineno if caller_frame else "unknown"
+                    
+                    error_msg = self._create_dataclass_error_message(
+                        field.name, value, expected_type, filename, line_number
+                    )
+                    raise TypeError(error_msg)
+                finally:
+                    del frame
+    
+    def _validate_field_type(self, value, expected_type, field_name):
+        """Valida un campo específico."""
+        if value is None:
+            origin = get_origin(expected_type)
+            args = get_args(expected_type)
+            if origin is Union and type(None) in args:
+                return True
+        
+        return _validate_complex_types(value, (expected_type,))
+    
+    def _create_dataclass_error_message(self, field_name, value, expected_type, filename, line_number):
+        """Crea un mensaje de error para dataclass."""
+        received_type = type(value).__name__
+        expected_type_name = getattr(expected_type, '__name__', str(expected_type))
+        
+        return f"""Dataclass: {self.__class__.__name__}
+Field:     {field_name}
+File:      {filename}
+Line:      {line_number}
+Expected:  {expected_type_name}
+Received:  {received_type}
+Value:     {repr(value)}""".strip()
+    
+    def __setattr__(self, name, value):
+        """Intercepta la asignación de atributos para validar tipos en dataclass."""
+        if not name.startswith('_') and is_dataclass(self):
+            # Buscar el campo en el dataclass
+            field_types = {f.name: f.type for f in fields(self)}
+            if name in field_types:
+                expected_type = field_types[name]
+                if not self._validate_field_type(value, expected_type, name):
+                    frame = inspect.currentframe()
+                    try:
+                        caller_frame = frame.f_back
+                        filename = caller_frame.f_code.co_filename if caller_frame else "unknown"
+                        line_number = caller_frame.f_lineno if caller_frame else "unknown"
+                        
+                        error_msg = self._create_dataclass_error_message(
+                            name, value, expected_type, filename, line_number
+                        )
+                        raise TypeError(error_msg)
+                    finally:
+                        del frame
+        
+        super().__setattr__(name, value)
+
+# NEW: Decorator for dataclass validation
+def validated_dataclass(*dataclass_args, **dataclass_kwargs):
+    """
+    Decorator que combina @dataclass con validación automática de tipos.
+    
+    Uso:
+        @validated_dataclass
+        class Person:
+            name: str
+            age: int
+            emails: List[str] = field(default_factory=list)
+    """
+    def decorator(cls):
+        # Crear una nueva clase que herede de DataclassValidationMixin
+        class ValidatedDataclass(DataclassValidationMixin, cls):
+            pass
+        
+        # Copiar metadatos de la clase original
+        ValidatedDataclass.__name__ = cls.__name__
+        ValidatedDataclass.__qualname__ = cls.__qualname__
+        ValidatedDataclass.__module__ = cls.__module__
+        
+        # Aplicar el decorador @dataclass
+        return dataclass(*dataclass_args, **dataclass_kwargs)(ValidatedDataclass)
+    
+    return decorator
+
+# Function validation remains the same
+def validate_data(*, strict: bool = True, validate_return: bool = True,
+                 custom_types: Optional[Dict[str, Any]] = None, **types_override):
     """
     Decorator for validating function parameters and return types.
     Works with both synchronous and asynchronous functions.
@@ -316,48 +452,10 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,custom_ty
         custom_types: Dictionary with custom type mappings for parameters.
         **types_override: Optional dictionary to override specific types.
                          Has priority over type hints and custom_types.
-    
-    Examples:
-    
-    Basic use (uses type hints automatically):
-    @validate_data()
-    def my_function(name: str, age: int, price: float) -> str:
-        return f"{name} is {age} years old"
-    
-    @validate_data()
-    async def async_function(name: str, age: int) -> str:
-        await asyncio.sleep(0.1)  # Simulate async operation
-        return f"{name} is {age} years old"
-    
-    With override (overwrites specific type hints):
-    @validate_data(age=(int, str))  # Allows int or str for age
-    def my_function(name: str, age: int, price: float) -> str:
-        return f"{name} is {age} years old"
-    
-    Not strict (only validates overrides):
-    @validate_data(strict=False, age=int)
-    def my_function(name, age, price) -> str:  # Only validates 'age'
-        return f"{name} is {age} years old"
-    
-    Without return validation:
-    @validate_data(validate_return=False)
-    async def sum_numbers(a: int, b: int) -> int:
-        return a + b
-    
-    With custom types:
-    @validate_data(custom_types={'email': str, 'age': int, 'active': bool})
-    async def process_user(email, age, active):
-        await asyncio.sleep(0.1)
-        return f"User {email} processed"
-    
-    All options combined:
-    @validate_data(strict=True, validate_return=True, custom_types={'base_price': float},discount=(int, float))
-    async def calculate_price(base_price: float, discount: int, tax: float) -> float:
-        await asyncio.sleep(0.1)
-        return base_price * (1 - discount/100) * (1 + tax/100)
     """
     def decorator(func):
         is_async = asyncio.iscoroutinefunction(func)
+        
         if is_async:
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
@@ -376,28 +474,41 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,custom_ty
                     _validate_return_type(func, result)
                 return result
             return sync_wrapper
-    
+
     def _validate_parameters(func, args, kwargs):
         """Common parameter validation logic for both sync and async functions."""
         sig = inspect.signature(func)
         param_names = list(sig.parameters.keys())
+        
         frame = sys._getframe(2)  # Go up 2 frames to get the actual caller
         error_line = frame.f_lineno
         file_path = frame.f_code.co_filename
+        
         errors = []
+        
         _validate_override_parameters(sig, types_override, func.__name__)
+        
+        # Determine if it's a class method
         is_class_method = len(args) > 0 and len(param_names) > 0 and param_names[0] in ['self', 'cls']
+        
         if is_class_method:
             class_instance = args[0]
             class_name = class_instance.__class__.__name__ if param_names[0] == 'self' else args[0].__name__
             context = f"Method: {class_name}.{func.__name__}()"
         else:
             context = f"Function: {func.__name__}()"
+        
         if asyncio.iscoroutinefunction(func):
             context += " [async]"
+        
+        # Bind arguments
         bound_args = sig.bind(*args, **kwargs)
         bound_args.apply_defaults()
+        
+        # Collect types to validate
         types_to_validate = {}
+        
+        # Add type hints if strict mode is enabled
         if strict:
             for param_name, param in sig.parameters.items():
                 if param_name in ['self', 'cls']:
@@ -405,43 +516,69 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,custom_ty
                 types_from_annotation = _extract_types_from_annotation(param.annotation)
                 if types_from_annotation:
                     types_to_validate[param_name] = types_from_annotation
+        
+        # Add custom types (override annotation types)
         if custom_types:
             for param_name, custom_type in custom_types.items():
                 types_to_validate[param_name] = _normalize_types(custom_type)
+        
+        # Add override types (highest priority)
         for param_name, override_types_param in types_override.items():
             types_to_validate[param_name] = _normalize_types(override_types_param)
+        
+        # Validate each parameter
         for param_name, param in sig.parameters.items():
             if param_name in ['self', 'cls']:
                 continue
+            
             if param_name not in types_to_validate:
                 continue
+            
             if param_name not in bound_args.arguments:
                 continue
+            
             expected_types = types_to_validate[param_name]
             arg_value = bound_args.arguments[param_name]
+            
+            # Handle None values for Optional types
             if arg_value is None and type(None) in expected_types:
                 continue
+            
             received_type = type(arg_value)
+            
             if not _validate_complex_types(arg_value, expected_types):
                 param_index = param_names.index(param_name)
                 is_positional = param_index < len(args)
+                
                 object_detail = _create_object_detail(arg_value, received_type)
                 expected_types_str = " | ".join([getattr(type_, '__name__', str(type_)) for type_ in expected_types])
+                
                 if param_name in types_override:
                     type_source = "override"
                 elif custom_types and param_name in custom_types:
                     type_source = "custom_types"
                 else:
                     type_source = "type hint"
-                error_info = {'type': 'positional' if is_positional else 'named','name': param_name,'position': param_index + 1 if is_positional else None,'expected_type': expected_types_str,'received_type': received_type.__name__,'object_detail': object_detail,'type_source': type_source}
+                
+                error_info = {
+                    'type': 'positional' if is_positional else 'named',
+                    'name': param_name,
+                    'position': param_index + 1 if is_positional else None,
+                    'expected_type': expected_types_str,
+                    'received_type': received_type.__name__,
+                    'object_detail': object_detail,
+                    'type_source': type_source
+                }
                 errors.append(error_info)
+        
         if errors:
             error_msg = _create_optimized_error_message(errors, file_path, error_line, context)
             raise ValidationError(error_msg)
-    
+
     def _validate_return_type(func, result):
         """Common return type validation logic for both sync and async functions."""
         sig = inspect.signature(func)
+        
         if sig.return_annotation != inspect.Signature.empty:
             expected_return_type = sig.return_annotation
             if not _validate_complex_types(result, (expected_return_type,)):
@@ -468,61 +605,25 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,custom_ty
                 error_msg += f"{'='*70}"
                 raise ValidationError(error_msg)
     return decorator
-
 def create_validator(custom_types: Dict[str, Any], **kwargs):
     """
     Creates a custom validator with specific types.
     Works with both synchronous and asynchronous functions.
-    
     Args:
         custom_types: Dictionary with types to validate
         **kwargs: Additional arguments passed to validate_data
-    
     Returns:
         Configured decorator
-    
-    Examples:
-    
-    Create a validator for user data:
-    user_validator = create_validator({
-        'email': str,
-        'age': int,
-        'active': bool
-    })
-    
-    @user_validator
-    def process_user(email, age, active):
-        return f"User {email} processed"
-    
-    @user_validator
-    async def async_process_user(email, age, active):
-        await asyncio.sleep(0.1)
-        return f"User {email} processed"
-    
-    Create a validator with additional options:
-    strict_validator = create_validator(
-        {'price': float, 'quantity': int},
-        strict=False,
-        validate_return=False
-    )
-    
-    @strict_validator
-    async def calculate_total(price, quantity):
-        await asyncio.sleep(0.1)
-        return price * quantity
     """
     return validate_data(custom_types=custom_types, **kwargs)
-
 class ValidationError(ValueError):
     """Custom exception for type validation errors."""
     pass
-
 def _normalize_types(types):
     """Normalizes types to a tuple format."""
     if isinstance(types, (list, tuple)):
         return tuple(types)
     return (types,)
-
 def _extract_types_from_annotation(annotation):
     """Extracts types from type annotation."""
     if annotation == inspect.Parameter.empty:
@@ -536,7 +637,6 @@ def _extract_types_from_annotation(annotation):
     if origin is not None:
         return (origin,)
     return (annotation,)
-
 def _create_object_detail(arg, received_type):
     """Creates detailed object representation for error messages."""
     if hasattr(arg, '__dict__'):
@@ -559,7 +659,6 @@ def _create_object_detail(arg, received_type):
             return f"{received_type.__name__}('{arg[:47]}...') with {len(arg)} characters"
     else:
         return f"{received_type.__name__}({repr(arg)})"
-
 def _validate_override_parameters(sig, types_override, func_name):
     """Validates that all parameters specified in the override exist in the function."""
     param_names = set(sig.parameters.keys())
@@ -581,7 +680,6 @@ def _validate_override_parameters(sig, types_override, func_name):
         error_msg += f"correspond exactly with the function parameters.\n"
         error_msg += f"{'='*70}"
         raise ValueError(error_msg)
-
 def _create_optimized_error_message(errors, file_path, error_line, context):
     """Creates an optimized and more readable error message."""
     error_msg = f"\n{'='*70}\n"
@@ -603,7 +701,6 @@ def _create_optimized_error_message(errors, file_path, error_line, context):
         error_msg += f"   📦 Value: {error['object_detail']}\n"
     error_msg += f"\n{'='*70}"
     return error_msg
-
 def _validate_complex_types(arg_value, expected_types):
     """Validates complex types like List[int], Dict[str, int], etc."""
     for expected_type in expected_types:
