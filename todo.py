@@ -140,6 +140,12 @@ def to_set_of(obj: Any, element_type: Type) -> set:
         from typing import Set
         return check_type(obj, Set[element_type])
 
+import json
+import inspect
+from typing import Type, Any, Dict, List, Union
+from datetime import datetime, date
+from decimal import Decimal
+
 class TypedAttribute:
     """
     Descriptor que maneja la validación de tipos para atributos de clases Strict.
@@ -168,19 +174,16 @@ class TypedAttribute:
                 caller_frame = frame.f_back
                 while caller_frame and self._is_internal_frame(caller_frame):
                     caller_frame = caller_frame.f_back
-                
                 if caller_frame:
                     filename = caller_frame.f_code.co_filename
                     line_number = caller_frame.f_lineno
                 else:
                     filename = "unknown"
                     line_number = "unknown"
-                
                 error_msg = self._create_error_message(value, filename, line_number)
                 raise TypeError(error_msg)
             finally:
                 del frame
-        
         setattr(instance, self.private_name, value)
 
     def _is_internal_frame(self, frame):
@@ -188,20 +191,13 @@ class TypedAttribute:
         code = frame.f_code
         filename = code.co_filename
         function_name = code.co_name
-        
-        internal_functions = {
-            '__init__', '__setattr__', '__set__', '_validate_kwargs',
-            '_create_error_message', '_is_internal_frame'
-        }
-        
-        return (function_name in internal_functions or 
-                'Strict' in str(frame.f_locals.get('self', '')))
+        internal_functions = {'__init__', '__setattr__', '__set__', '_validate_kwargs','_create_error_message', '_is_internal_frame'}
+        return (function_name in internal_functions or 'Strict' in str(frame.f_locals.get('self', '')))
 
     def _create_error_message(self, value, filename, line_number):
         """Crea un mensaje de error detallado y legible."""
         received_type = type(value).__name__
         expected_type = self.expected_type.__name__
-        
         return f"""Class:     {self.class_name}
 Attribute: {self.name}
 File:      {filename}
@@ -209,6 +205,27 @@ Line:      {line_number}
 Expected:  {expected_type}
 Received:  {received_type}
 Value:     {repr(value)}""".strip()
+
+class StrictJSONEncoder(json.JSONEncoder):
+    """
+    Encoder JSON personalizado para objetos Strict.
+    Maneja automáticamente la serialización de objetos Strict y otros tipos comunes.
+    """
+    def default(self, obj):
+        """Serializa objetos que no son nativamente JSON-serializables."""
+        if isinstance(obj, Strict):
+            return obj.to_dict()
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, set):
+            return list(obj)
+        if hasattr(obj, 'to_dict') and callable(getattr(obj, 'to_dict')):
+            return obj.to_dict()
+        if hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return super().default(obj)
 
 class StrictMeta(type):
     """
@@ -220,23 +237,17 @@ class StrictMeta(type):
     - Almacena información de tipos para validación
     """
     def __new__(mcs, name, bases, namespace, **kwargs):
-        # Recopilar atributos tipados de clases base
         base_typed_attrs = {}
         for base in bases:
             if hasattr(base, '_typed_attributes'):
                 base_typed_attrs.update(base._typed_attributes)
-        
-        # Identificar atributos tipados en la clase actual
         typed_attrs = {}
         for attr_name, attr_value in list(namespace.items()):
             if isinstance(attr_value, type) and not attr_name.startswith('_'):
                 typed_attrs[attr_name] = attr_value
                 namespace[attr_name] = TypedAttribute(attr_name, attr_value, name)
-        
-        # Combinar atributos tipados
         all_typed_attrs = {**base_typed_attrs, **typed_attrs}
         namespace['_typed_attributes'] = all_typed_attrs
-        
         return super().__new__(mcs, name, bases, namespace, **kwargs)
 
 class Strict(metaclass=StrictMeta):
@@ -248,14 +259,17 @@ class Strict(metaclass=StrictMeta):
     - Soporte para herencia de tipos
     - Constructor automático con argumentos de palabra clave
     - Validación continua en asignaciones posteriores
+    - Serialización automática a JSON
+    - Deserialización desde JSON
     
     Ejemplo de uso:
         class Persona(Strict):
             name = str
             age = int
         
-        persona = Persona(name="Juan", age=30)  # OK
-        persona.age = "treinta"  # TypeError con detalles
+        persona = Persona(name="Juan", age=30)
+        json_str = persona.to_json()
+        persona2 = Persona.from_json(json_str)
     """
     def __init__(self, **kwargs):
         """
@@ -269,11 +283,8 @@ class Strict(metaclass=StrictMeta):
             ValueError: Si faltan atributos requeridos o se proporcionan atributos no declarados
         """
         self._validate_kwargs(kwargs)
-        
         for attr_name, value in kwargs.items():
             setattr(self, attr_name, value)
-        
-        # Verificar que todos los atributos requeridos estén presentes
         missing_attrs = set(self._typed_attributes.keys()) - set(kwargs.keys())
         if missing_attrs:
             raise ValueError(f"Missing required attributes for {self.__class__.__name__}: "
@@ -306,7 +317,6 @@ class Strict(metaclass=StrictMeta):
         if name.startswith('_'):
             super().__setattr__(name, value)
             return
-        
         if name in self._typed_attributes:
             super().__setattr__(name, value)
         else:
@@ -322,7 +332,224 @@ class Strict(metaclass=StrictMeta):
                 attrs.append(f"{attr_name}={repr(value)}")
         return f"{self.__class__.__name__}({', '.join(attrs)})"
 
-# NEW: Dataclass integration
+    def to_dict(self, include_class_name: bool = False) -> Dict[str, Any]:
+        """
+        Convierte el objeto a un diccionario.
+        
+        Args:
+            include_class_name: Si incluir el nombre de la clase en el diccionario
+        
+        Returns:
+            Dict con los atributos del objeto
+        """
+        result = {}
+        if include_class_name:
+            result['__class__'] = self.__class__.__name__
+        for attr_name in self._typed_attributes:
+            value = getattr(self, attr_name, None)
+            if value is not None:
+                result[attr_name] = self._serialize_value(value)
+        return result
+
+    def _serialize_value(self, value: Any) -> Any:
+        """
+        Serializa un valor para JSON, manejando tipos especiales.
+        
+        Args:
+            value: Valor a serializar
+        
+        Returns:
+            Valor serializable en JSON
+        """
+        if isinstance(value, Strict):
+            return value.to_dict()
+        if isinstance(value, list):
+            return [self._serialize_value(item) for item in value]
+        if isinstance(value, dict):
+            return {k: self._serialize_value(v) for k, v in value.items()}
+        if isinstance(value, set):
+            return list(value)
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return float(value)
+        if hasattr(value, '__dict__') and not isinstance(value, (str, int, float, bool)):
+            try:
+                return {k: self._serialize_value(v) for k, v in value.__dict__.items()}
+            except:
+                pass
+        return value
+
+    def to_json(self, indent: int = None, include_class_name: bool = False) -> str:
+        """
+        Convierte el objeto a JSON string.
+        
+        Args:
+            indent: Número de espacios para indentación (None = compacto)
+            include_class_name: Si incluir el nombre de la clase
+        
+        Returns:
+            String JSON del objeto
+        """
+        data = self.to_dict(include_class_name=include_class_name)
+        return json.dumps(data, cls=StrictJSONEncoder, indent=indent, ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Strict':
+        """
+        Crea una instancia desde un diccionario.
+        
+        Args:
+            data: Diccionario con los datos del objeto
+        
+        Returns:
+            Nueva instancia de la clase
+        
+        Raises:
+            ValueError: Si los datos no son válidos
+        """
+        clean_data = {k: v for k, v in data.items() if k != '__class__'}
+        processed_data = {}
+        for attr_name, value in clean_data.items():
+            if attr_name in cls._typed_attributes:
+                expected_type = cls._typed_attributes[attr_name]
+                processed_data[attr_name] = cls._deserialize_value(value, expected_type)
+            else:
+                processed_data[attr_name] = value
+        return cls(**processed_data)
+
+    @classmethod
+    def _deserialize_value(cls, value: Any, expected_type: Type) -> Any:
+        """
+        Deserializa un valor desde JSON, manejando tipos especiales.
+        
+        Args:
+            value: Valor a deserializar
+            expected_type: Tipo esperado del valor
+        
+        Returns:
+            Valor deserializado
+        """
+        if value is None:
+            return value
+        if isinstance(value, expected_type):
+            return value
+        if isinstance(value, dict) and hasattr(expected_type, '_typed_attributes'):
+            return expected_type.from_dict(value)
+        if expected_type == list and isinstance(value, list):
+            return value
+        if expected_type == set and isinstance(value, list):
+            return set(value)
+        if expected_type == dict and isinstance(value, dict):
+            return value
+        if expected_type == datetime and isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except:
+                pass
+        if expected_type == date and isinstance(value, str):
+            try:
+                return date.fromisoformat(value)
+            except:
+                pass
+        if expected_type == Decimal and isinstance(value, (int, float)):
+            return Decimal(str(value))
+        try:
+            return expected_type(value)
+        except:
+            return value
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'Strict':
+        """
+        Crea una instancia desde un JSON string.
+        
+        Args:
+            json_str: String JSON con los datos del objeto
+        
+        Returns:
+            Nueva instancia de la clase
+        
+        Raises:
+            ValueError: Si el JSON no es válido
+            TypeError: Si los datos no coinciden con los tipos esperados
+        """
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}")
+        if not isinstance(data, dict):
+            raise ValueError("JSON must represent an object (dictionary)")
+        return cls.from_dict(data)
+
+    def to_pretty_json(self, include_class_name: bool = False) -> str:
+        """
+        Convierte el objeto a JSON formateado de manera legible.
+        
+        Args:
+            include_class_name: Si incluir el nombre de la clase
+        
+        Returns:
+            String JSON formateado
+        """
+        return self.to_json(indent=2, include_class_name=include_class_name)
+
+    def save_to_file(self, filename: str, include_class_name: bool = False, pretty: bool = True):
+        """
+        Guarda el objeto en un archivo JSON.
+        
+        Args:
+            filename: Nombre del archivo
+            include_class_name: Si incluir el nombre de la clase
+            pretty: Si formatear el JSON de manera legible
+        """
+        json_str = self.to_json(indent=2 if pretty else None,include_class_name=include_class_name)
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(json_str)
+
+    @classmethod
+    def load_from_file(cls, filename: str) -> 'Strict':
+        """
+        Carga un objeto desde un archivo JSON.
+        
+        Args:
+            filename: Nombre del archivo
+        
+        Returns:
+            Nueva instancia de la clase
+        
+        Raises:
+            FileNotFoundError: Si el archivo no existe
+            ValueError: Si el JSON no es válido
+        """
+        with open(filename, 'r', encoding='utf-8') as f:
+            json_str = f.read()
+        return cls.from_json(json_str)
+
+    def __eq__(self, other):
+        """Compara dos objetos Strict por igualdad."""
+        if not isinstance(other, self.__class__):
+            return False
+        for attr_name in self._typed_attributes:
+            if getattr(self, attr_name, None) != getattr(other, attr_name, None):
+                return False
+        return True
+
+    def __hash__(self):
+        """Genera hash del objeto basado en sus atributos."""
+        values = []
+        for attr_name in sorted(self._typed_attributes.keys()):
+            value = getattr(self, attr_name, None)
+            if isinstance(value, (list, dict, set)):
+                if isinstance(value, list):
+                    value = tuple(value)
+                elif isinstance(value, dict):
+                    value = tuple(sorted(value.items()))
+                elif isinstance(value, set):
+                    value = tuple(sorted(value))
+            values.append(value)
+        return hash((self.__class__.__name__, tuple(values)))
+
 class DataclassValidationMixin:
     """
     Mixin que añade validación de tipos a dataclasses.
