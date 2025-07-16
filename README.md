@@ -17,8 +17,8 @@ A powerful and flexible Python decorator library for runtime type validation usi
 ## Installation
 
 ```bash
-# Add to your project (currently not on PyPI)
-# Copy the validation module to your project
+!pip install python-type
+from python-type import *
 ```
 
 ## Requirements
