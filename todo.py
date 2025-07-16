@@ -8,10 +8,39 @@ from dataclasses import dataclass, fields, is_dataclass
 import json
 from datetime import datetime, date
 from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing as mp
 
 class TypeConversionError(Exception):
     """Custom exception for type conversion errors"""
     pass
+
+class BatchValidationResult:
+    """Resultado de la validación en batch"""
+    def __init__(self):
+        self.successful: List[Any] = []
+        self.failed: List[Tuple[int, Any, Exception]] = []
+        self.success_rate: float = 0.0
+        self.total_processed: int = 0
+    
+    def add_success(self, item: Any):
+        self.successful.append(item)
+    
+    def add_failure(self, index: int, item: Any, error: Exception):
+        self.failed.append((index, item, error))
+    
+    def finalize(self):
+        self.total_processed = len(self.successful) + len(self.failed)
+        self.success_rate = len(self.successful) / self.total_processed if self.total_processed > 0 else 0.0
+    
+    def get_summary(self) -> dict:
+        return {
+            "total_processed": self.total_processed,
+            "successful": len(self.successful),
+            "failed": len(self.failed),
+            "success_rate": f"{self.success_rate:.2%}",
+            "errors": [(idx, type(item).__name__, str(error)) for idx, item, error in self.failed]
+        }
 
 def convert(obj, target_type):
     """
@@ -86,7 +115,6 @@ def _convert_simple_type(obj: Any, target_type: Type) -> Any:
             return converter(obj)
         except (ValueError, TypeError, AttributeError) as e:
             raise TypeConversionError(f"Cannot convert {type(obj).__name__} to {target_type.__name__}: {e}")
-    
     try:
         return target_type(obj)
     except (ValueError, TypeError, AttributeError) as e:
@@ -110,14 +138,223 @@ def check_type(obj: Any, target_type: Type, auto_convert: bool = True) -> Any:
     """
     if type(obj) is target_type:
         return obj
-    
     if not auto_convert:
         raise TypeConversionError(f"Object is {type(obj).__name__}, expected {target_type}")
-    
     if hasattr(target_type, '__origin__') or get_origin(target_type) is not None:
         return _convert_generic_type(obj, target_type)
-    
     return _convert_simple_type(obj, target_type)
+
+def _validate_single_item(args):
+    """Función auxiliar para validación paralela"""
+    index, item, target_type, auto_convert = args
+    try:
+        converted = check_type(item, target_type, auto_convert=auto_convert)
+        return (True, index, converted, None)
+    except Exception as e:
+        return (False, index, item, e)
+
+def batch_check_type(items: List[Any], target_type: Type, auto_convert: bool = True,parallel: bool = None,max_workers: Optional[int] = None,chunk_size: Optional[int] = None,min_parallel_size: int = 50000) -> BatchValidationResult:
+    """
+    Valida una lista de items contra un tipo específico con alta performance.
+    
+    Args:
+        items: Lista de items a validar
+        target_type: Tipo objetivo al que convertir/validar
+        auto_convert: Si realizar conversión automática
+        parallel: Si usar procesamiento paralelo (None = auto-detect)
+        max_workers: Número máximo de workers (None = auto)
+        chunk_size: Tamaño de chunk para procesamiento (None = auto)
+        min_parallel_size: Tamaño mínimo para activar paralelización automática
+    
+    Returns:
+        BatchValidationResult con resultados de la validación
+    """
+    result = BatchValidationResult()
+    if not items:
+        result.finalize()
+        return result
+    if parallel is None:
+        should_parallelize = (len(items) >= min_parallel_size and _is_complex_type(target_type))
+        parallel = should_parallelize
+    if chunk_size is None:
+        if parallel:
+            chunk_size = max(1000, len(items) // (max_workers or mp.cpu_count() * 2))
+        else:
+            chunk_size = len(items)
+    if parallel and len(items) > 1000:
+        _batch_check_parallel(items, target_type, auto_convert, max_workers, chunk_size, result)
+    else:
+        _batch_check_sequential_optimized(items, target_type, auto_convert, result)
+    result.finalize()
+    return result
+
+def _is_complex_type(target_type: Type) -> bool:
+    """Determina si un tipo es complejo y se beneficia de paralelización"""
+    complex_types = {dict, list, tuple, set}
+    origin = get_origin(target_type)
+    if origin is not None:
+        return origin in complex_types or origin is Union
+    try:
+        return is_dataclass(target_type) or hasattr(target_type, '__dataclass_fields__')
+    except:
+        return False
+
+def _batch_check_sequential_optimized(items: List[Any], target_type: Type, auto_convert: bool, result: BatchValidationResult):
+    """Validación secuencial ultra-optimizada"""
+    converter = _ULTRA_CONVERSION_CACHE.get(target_type)
+    is_generic = hasattr(target_type, '__origin__') or get_origin(target_type) is not None
+    if not auto_convert:
+        for i, item in enumerate(items):
+            if type(item) is target_type:
+                result.add_success(item)
+            else:
+                result.add_failure(i, item, TypeConversionError(f"Object is {type(item).__name__}, expected {target_type}"))
+        return
+    if converter is not None and not is_generic:
+        for i, item in enumerate(items):
+            if type(item) is target_type:
+                result.add_success(item)
+            else:
+                try:
+                    converted = converter(item)
+                    result.add_success(converted)
+                except (ValueError, TypeError, AttributeError) as e:
+                    result.add_failure(i, item, TypeConversionError(f"Cannot convert {type(item).__name__} to {target_type.__name__}: {e}"))
+        return
+    for i, item in enumerate(items):
+        try:
+            converted = check_type(item, target_type, auto_convert=auto_convert)
+            result.add_success(converted)
+        except Exception as e:
+            result.add_failure(i, item, e)
+
+def _batch_check_parallel(items: List[Any], target_type: Type, auto_convert: bool, max_workers: Optional[int], chunk_size: int, result: BatchValidationResult):
+    """Validación paralela usando ThreadPoolExecutor"""
+    if max_workers is None:
+        max_workers = min(mp.cpu_count(), len(items) // chunk_size + 1)
+    args_list = [(i, item, target_type, auto_convert) for i, item in enumerate(items)]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for i in range(0, len(args_list), chunk_size):
+            chunk = args_list[i:i + chunk_size]
+            future = executor.submit(_process_chunk, chunk)
+            futures.append(future)
+        for future in futures:
+            chunk_results = future.result()
+            for success, index, item_or_converted, error in chunk_results:
+                if success:
+                    result.add_success(item_or_converted)
+                else:
+                    result.add_failure(index, item_or_converted, error)
+
+def _process_chunk(chunk_args):
+    """Procesa un chunk de items"""
+    return [_validate_single_item(args) for args in chunk_args]
+
+def batch_validate_schema(items: List[dict], schema: Dict[str, Type],auto_convert: bool = True,parallel: bool = None,max_workers: Optional[int] = None,min_parallel_size: int = 25000) -> BatchValidationResult:
+    """
+    Valida una lista de diccionarios contra un esquema definido.
+    
+    Args:
+        items: Lista de diccionarios a validar
+        schema: Esquema con nombres de campos y tipos esperados
+        auto_convert: Si realizar conversión automática
+        parallel: Si usar procesamiento paralelo (None = auto-detect)
+        max_workers: Número máximo de workers
+        min_parallel_size: Tamaño mínimo para paralelización automática
+    
+    Returns:
+        BatchValidationResult con resultados de la validación
+    """
+    result = BatchValidationResult()
+    if not items:
+        result.finalize()
+        return result
+    if parallel is None:
+        complex_fields = sum(1 for field_type in schema.values() if _is_complex_type(field_type))
+        should_parallelize = (len(items) >= min_parallel_size and complex_fields >= len(schema) * 0.3)
+        parallel = should_parallelize
+    if parallel and len(items) > 5000:
+        _batch_validate_schema_parallel(items, schema, auto_convert, max_workers, result)
+    else:
+        _batch_validate_schema_sequential_optimized(items, schema, auto_convert, result)
+    result.finalize()
+    return result
+
+def _batch_validate_schema_sequential_optimized(items: List[dict], schema: Dict[str, Type], auto_convert: bool, result: BatchValidationResult):
+    """Validación secuencial ultra-optimizada de esquemas"""
+    field_converters = {}
+    field_is_generic = {}
+    for field_name, field_type in schema.items():
+        field_converters[field_name] = _ULTRA_CONVERSION_CACHE.get(field_type)
+        field_is_generic[field_name] = hasattr(field_type, '__origin__') or get_origin(field_type) is not None
+    schema_keys = set(schema.keys())
+    if not auto_convert:
+        for i, item in enumerate(items):
+            try:
+                item_keys = set(item.keys())
+                missing_fields = schema_keys - item_keys
+                if missing_fields:
+                    raise TypeConversionError(f"Missing required fields: {', '.join(missing_fields)}")
+                validated_item = {}
+                for field_name, field_type in schema.items():
+                    field_value = item[field_name]
+                    if type(field_value) is field_type:
+                        validated_item[field_name] = field_value
+                    else:
+                        raise TypeConversionError(f"Field '{field_name}' is {type(field_value).__name__}, expected {field_type}")
+                result.add_success(validated_item)
+            except Exception as e:
+                result.add_failure(i, item, e)
+        return
+    for i, item in enumerate(items):
+        try:
+            if not schema_keys.issubset(item.keys()):
+                missing_fields = schema_keys - item.keys()
+                raise TypeConversionError(f"Missing required fields: {', '.join(missing_fields)}")
+            validated_item = {}
+            for field_name, field_type in schema.items():
+                field_value = item[field_name]
+                if type(field_value) is field_type:
+                    validated_item[field_name] = field_value
+                    continue
+                converter = field_converters[field_name]
+                if converter is not None and not field_is_generic[field_name]:
+                    try:
+                        validated_item[field_name] = converter(field_value)
+                        continue
+                    except (ValueError, TypeError, AttributeError) as e:
+                        raise TypeConversionError(f"Cannot convert field '{field_name}' from {type(field_value).__name__} to {field_type.__name__}: {e}")
+                validated_item[field_name] = check_type(field_value, field_type, auto_convert=True)
+            result.add_success(validated_item)
+        except Exception as e:
+            result.add_failure(i, item, e)
+
+def _batch_validate_schema_parallel(items: List[dict], schema: Dict[str, Type], auto_convert: bool, max_workers: Optional[int], result: BatchValidationResult):
+    """Validación paralela de esquemas"""
+    if max_workers is None:
+        max_workers = min(mp.cpu_count(), len(items) // 100 + 1)
+    def validate_item_schema(args):
+        index, item = args
+        try:
+            validated_item = {}
+            for field_name, field_type in schema.items():
+                if field_name in item:
+                    validated_item[field_name] = check_type(item[field_name], field_type, auto_convert=auto_convert)
+                else:
+                    raise TypeConversionError(f"Missing required field: {field_name}")
+            return (True, index, validated_item, None)
+        except Exception as e:
+            return (False, index, item, e)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        args_list = [(i, item) for i, item in enumerate(items)]
+        futures = [executor.submit(validate_item_schema, args) for args in args_list]
+        for future in futures:
+            success, index, item_or_validated, error = future.result()
+            if success:
+                result.add_success(item_or_validated)
+            else:
+                result.add_failure(index, item_or_validated, error)
 
 def to_list_of(obj: Any, element_type: Type) -> list:
     """Converts obj to List[element_type]"""
@@ -142,6 +379,16 @@ def to_set_of(obj: Any, element_type: Type) -> set:
     else:
         from typing import Set
         return check_type(obj, Set[element_type])
+
+def batch_to_list_of(items: List[Any], element_type: Type, **kwargs) -> BatchValidationResult:
+    """Convierte batch de items a List[element_type]"""
+    target_type = list[element_type] if sys.version_info >= (3, 9) else List[element_type]
+    return batch_check_type(items, target_type, **kwargs)
+
+def batch_to_dict_of(items: List[Any], key_type: Type, value_type: Type, **kwargs) -> BatchValidationResult:
+    """Convierte batch de items a Dict[key_type, value_type]"""
+    target_type = dict[key_type, value_type] if sys.version_info >= (3, 9) else Dict[key_type, value_type]
+    return batch_check_type(items, target_type, **kwargs)
 
 class TypedAttribute:
     """
@@ -662,12 +909,16 @@ def validated_dataclass(*dataclass_args, **dataclass_kwargs):
     
     return decorator
 
-# Function validation remains the same
-def validate_data(*, strict: bool = True, validate_return: bool = True,
-                 custom_types: Optional[Dict[str, Any]] = None, **types_override):
+import functools
+import inspect
+import asyncio
+import sys
+from typing import get_origin, get_args, Union, Dict, Any, Optional
+
+def validate_data(*, strict: bool = True, validate_return: bool = True, custom_types: Optional[Dict[str, Any]] = None, **types_override):
     """
     Decorator for validating function parameters and return types.
-    Works with both synchronous and asynchronous functions.
+    Works with both synchronous and asynchronous functions, including lambdas.
     
     Args:
         strict: If True, validates all parameters with type hints.
@@ -676,30 +927,36 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,
         custom_types: Dictionary with custom type mappings for parameters.
         **types_override: Optional dictionary to override specific types.
                          Has priority over type hints and custom_types.
+    
+    Note: Lambda functions have limitations:
+    - No type hints available (must use custom_types or types_override)
+    - Parameter names may be generic (arg0, arg1, etc.)
+    - Limited debugging information
     """
     def decorator(func):
         is_async = asyncio.iscoroutinefunction(func)
+        is_lambda = func.__name__ == '<lambda>'
         
         if is_async:
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
-                _validate_parameters(func, args, kwargs)
+                _validate_parameters(func, args, kwargs, is_lambda)
                 result = await func(*args, **kwargs)
                 if validate_return:
-                    _validate_return_type(func, result)
+                    _validate_return_type(func, result, is_lambda)
                 return result
             return async_wrapper
         else:
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
-                _validate_parameters(func, args, kwargs)
+                _validate_parameters(func, args, kwargs, is_lambda)
                 result = func(*args, **kwargs)
                 if validate_return:
-                    _validate_return_type(func, result)
+                    _validate_return_type(func, result, is_lambda)
                 return result
             return sync_wrapper
 
-    def _validate_parameters(func, args, kwargs):
+    def _validate_parameters(func, args, kwargs, is_lambda):
         """Common parameter validation logic for both sync and async functions."""
         sig = inspect.signature(func)
         param_names = list(sig.parameters.keys())
@@ -712,10 +969,12 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,
         
         _validate_override_parameters(sig, types_override, func.__name__)
         
-        # Determine if it's a class method
-        is_class_method = len(args) > 0 and len(param_names) > 0 and param_names[0] in ['self', 'cls']
+        # Determine if it's a class method (not applicable for lambdas)
+        is_class_method = not is_lambda and len(args) > 0 and len(param_names) > 0 and param_names[0] in ['self', 'cls']
         
-        if is_class_method:
+        if is_lambda:
+            context = f"Lambda function: {func.__name__}"
+        elif is_class_method:
             class_instance = args[0]
             class_name = class_instance.__class__.__name__ if param_names[0] == 'self' else args[0].__name__
             context = f"Method: {class_name}.{func.__name__}()"
@@ -726,20 +985,31 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,
             context += " [async]"
         
         # Bind arguments
-        bound_args = sig.bind(*args, **kwargs)
-        bound_args.apply_defaults()
+        try:
+            bound_args = sig.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+        except TypeError as e:
+            # Handle binding errors more gracefully for lambdas
+            if is_lambda:
+                raise ValidationError(f"Lambda function signature mismatch: {e}")
+            else:
+                raise ValidationError(f"Function signature mismatch: {e}")
         
         # Collect types to validate
         types_to_validate = {}
         
-        # Add type hints if strict mode is enabled
-        if strict:
+        # Add type hints if strict mode is enabled (usually not available for lambdas)
+        if strict and not is_lambda:
             for param_name, param in sig.parameters.items():
                 if param_name in ['self', 'cls']:
                     continue
                 types_from_annotation = _extract_types_from_annotation(param.annotation)
                 if types_from_annotation:
                     types_to_validate[param_name] = types_from_annotation
+        
+        # For lambdas in strict mode, warn that type hints are not available
+        if strict and is_lambda and not custom_types and not types_override:
+            print(f"Warning: Lambda function has no type hints. Use custom_types or types_override for validation.")
         
         # Add custom types (override annotation types)
         if custom_types:
@@ -791,7 +1061,8 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,
                     'expected_type': expected_types_str,
                     'received_type': received_type.__name__,
                     'object_detail': object_detail,
-                    'type_source': type_source
+                    'type_source': type_source,
+                    'is_lambda': is_lambda
                 }
                 errors.append(error_info)
         
@@ -799,7 +1070,7 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,
             error_msg = _create_optimized_error_message(errors, file_path, error_line, context)
             raise ValidationError(error_msg)
 
-    def _validate_return_type(func, result):
+    def _validate_return_type(func, result, is_lambda):
         """Common return type validation logic for both sync and async functions."""
         sig = inspect.signature(func)
         
@@ -809,14 +1080,20 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,
                 frame = sys._getframe(2)  # Go up 2 frames to get the actual caller
                 error_line = frame.f_lineno
                 file_path = frame.f_code.co_filename
-                is_class_method = hasattr(func, '__self__')
-                if is_class_method:
-                    class_name = func.__self__.__class__.__name__
-                    context = f"Method: {class_name}.{func.__name__}()"
+                
+                if is_lambda:
+                    context = f"Lambda function: {func.__name__}"
                 else:
-                    context = f"Function: {func.__name__}()"
+                    is_class_method = hasattr(func, '__self__')
+                    if is_class_method:
+                        class_name = func.__self__.__class__.__name__
+                        context = f"Method: {class_name}.{func.__name__}()"
+                    else:
+                        context = f"Function: {func.__name__}()"
+                
                 if asyncio.iscoroutinefunction(func):
                     context += " [async]"
+                
                 error_msg = f"\n{'='*70}\n"
                 error_msg += f"RETURN TYPE VALIDATION ERROR\n"
                 error_msg += f"{'='*70}\n"
@@ -826,13 +1103,20 @@ def validate_data(*, strict: bool = True, validate_return: bool = True,
                 error_msg += f"✅ Expected type: {getattr(expected_return_type, '__name__', str(expected_return_type))}\n"
                 error_msg += f"❌ Received type: {type(result).__name__}\n"
                 error_msg += f"📦 Value: {repr(result)}\n"
+                if is_lambda:
+                    error_msg += f"⚠️  Note: Lambda functions have limited debugging info\n"
                 error_msg += f"{'='*70}"
                 raise ValidationError(error_msg)
+        elif is_lambda and validate_return:
+            # For lambdas without return annotation, we can't validate return type
+            print(f"Warning: Lambda function has no return type annotation. Cannot validate return type.")
+    
     return decorator
+
 def create_validator(custom_types: Dict[str, Any], **kwargs):
     """
     Creates a custom validator with specific types.
-    Works with both synchronous and asynchronous functions.
+    Works with both synchronous and asynchronous functions, including lambdas.
     Args:
         custom_types: Dictionary with types to validate
         **kwargs: Additional arguments passed to validate_data
@@ -840,14 +1124,50 @@ def create_validator(custom_types: Dict[str, Any], **kwargs):
         Configured decorator
     """
     return validate_data(custom_types=custom_types, **kwargs)
+
+def create_lambda_validator(param_types: Dict[str, Any], return_type: Any = None, **kwargs):
+    """
+    Creates a validator specifically designed for lambda functions.
+    
+    Args:
+        param_types: Dictionary mapping parameter names to expected types
+        return_type: Expected return type (optional)
+        **kwargs: Additional arguments passed to validate_data
+    
+    Returns:
+        Configured decorator for lambda functions
+    
+    Example:
+        validator = create_lambda_validator({'x': int, 'y': int}, return_type=int)
+        add = validator(lambda x, y: x + y)
+    """
+    decorator_kwargs = {
+        'custom_types': param_types,
+        'strict': False,  # Lambda functions don't have type hints
+        'validate_return': return_type is not None,
+        **kwargs
+    }
+    
+    def lambda_decorator(func):
+        if return_type is not None:
+            # Add return type annotation manually for validation
+            func.__annotations__ = getattr(func, '__annotations__', {})
+            func.__annotations__['return'] = return_type
+        
+        return validate_data(**decorator_kwargs)(func)
+    
+    return lambda_decorator
+
 class ValidationError(ValueError):
     """Custom exception for type validation errors."""
     pass
+
 def _normalize_types(types):
     """Normalizes types to a tuple format."""
     if isinstance(types, (list, tuple)):
         return tuple(types)
     return (types,)
+
 def _extract_types_from_annotation(annotation):
     """Extracts types from type annotation."""
     if annotation == inspect.Parameter.empty:
@@ -861,6 +1181,7 @@ def _extract_types_from_annotation(annotation):
     if origin is not None:
         return (origin,)
     return (annotation,)
+
 def _create_object_detail(arg, received_type):
     """Creates detailed object representation for error messages."""
     if hasattr(arg, '__dict__'):
@@ -883,6 +1204,7 @@ def _create_object_detail(arg, received_type):
             return f"{received_type.__name__}('{arg[:47]}...') with {len(arg)} characters"
     else:
         return f"{received_type.__name__}({repr(arg)})"
+
 def _validate_override_parameters(sig, types_override, func_name):
     """Validates that all parameters specified in the override exist in the function."""
     param_names = set(sig.parameters.keys())
@@ -890,20 +1212,27 @@ def _validate_override_parameters(sig, types_override, func_name):
     param_names.discard('cls')
     override_parameters = set(types_override.keys())
     non_existent_parameters = override_parameters - param_names
+    
     if non_existent_parameters:
         available_parameters = sorted(param_names)
         non_existent_parameters_sorted = sorted(non_existent_parameters)
+        
+        function_type = "Lambda function" if func_name == '<lambda>' else "Function"
+        
         error_msg = f"\n{'='*70}\n"
         error_msg += f"DECORATOR CONFIGURATION ERROR\n"
         error_msg += f"{'='*70}\n"
-        error_msg += f"Function: {func_name}()\n"
+        error_msg += f"{function_type}: {func_name}()\n"
         error_msg += f"Non-existent parameters in override: {non_existent_parameters_sorted}\n"
         error_msg += f"Available parameters in function: {available_parameters}\n"
         error_msg += f"{'='*70}\n"
         error_msg += f"Parameters specified in @validate_data() decorator must\n"
         error_msg += f"correspond exactly with the function parameters.\n"
+        if func_name == '<lambda>':
+            error_msg += f"For lambda functions, use parameter names like 'x', 'y', etc.\n"
         error_msg += f"{'='*70}"
         raise ValueError(error_msg)
+
 def _create_optimized_error_message(errors, file_path, error_line, context):
     """Creates an optimized and more readable error message."""
     error_msg = f"\n{'='*70}\n"
@@ -913,7 +1242,13 @@ def _create_optimized_error_message(errors, file_path, error_line, context):
     error_msg += f"📍 Line: {error_line}\n"
     error_msg += f"🔧 {context}\n"
     error_msg += f"❌ Errors found: {len(errors)}\n"
+    
+    # Add lambda-specific warning if any errors are from lambda functions
+    if any(error.get('is_lambda', False) for error in errors):
+        error_msg += f"⚠️  Note: Lambda functions have limited debugging capabilities\n"
+    
     error_msg += f"{'='*70}\n"
+    
     for i, error in enumerate(errors, 1):
         error_msg += f"\n💥 ERROR {i}:\n"
         if error['type'] == 'positional':
@@ -923,19 +1258,24 @@ def _create_optimized_error_message(errors, file_path, error_line, context):
         error_msg += f"   ✅ Expected: {error['expected_type']} (from {error['type_source']})\n"
         error_msg += f"   ❌ Received: {error['received_type']}\n"
         error_msg += f"   📦 Value: {error['object_detail']}\n"
+    
     error_msg += f"\n{'='*70}"
     return error_msg
+
 def _validate_complex_types(arg_value, expected_types):
     """Validates complex types like List[int], Dict[str, int], etc."""
     for expected_type in expected_types:
         origin = get_origin(expected_type)
         args = get_args(expected_type)
+        
         if origin is None:
             if isinstance(arg_value, expected_type):
                 return True
             continue
+        
         if not isinstance(arg_value, origin):
             continue
+        
         if origin is list and args:
             if all(isinstance(item, args[0]) for item in arg_value):
                 return True
