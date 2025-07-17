@@ -1,2 +1,2 @@
 Integración con Pydantic: Compatibilidad con modelos Pydantic existentes
-Lazy computing para clases, funciones e instancias
+Lazy computing para clases, funciones e instancias (tambien tienen que tener la funcion de convert)
