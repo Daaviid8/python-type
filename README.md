@@ -1,6 +1,6 @@
 # Python-Type Validation Library
 
-Una biblioteca completa de validación de tipos para Python que proporciona herramientas avanzadas para validar tipos de datos de forma eficiente y con mensajes de error detallados.
+Una biblioteca completa de validación de tipos para Python que proporciona herramientas avanzadas para validar tipos de datos de forma eficiente y con mensajes de error detallados. (Valida tipos de instancias existentes y crea instancias tipadas)
 
 ## Características Principales
 
