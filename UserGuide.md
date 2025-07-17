@@ -262,22 +262,32 @@ def update_user(user_id, data, active):
 ### Funciones Asíncronas
 
 ```python
+from python_type import validate_data, ValidationError
+import asyncio
+
 @validate_data()
 async def fetch_user(user_id: int) -> dict:
     # Simular búsqueda async
     await asyncio.sleep(0.1)
     return {"id": user_id, "name": "Usuario"}
 
-# Uso correcto
 async def main():
-    user = await fetch_user(123)
-    print(user)
+    # Uso correcto
+    try:
+        user = await fetch_user(123)
+        print("Usuario encontrado:", user)
+    except ValidationError as e:
+        print("Error de validación (123):", e)
 
-# Error en parámetros
-try:
-    user = await fetch_user("123")
-except ValidationError as e:
-    print(e)
+    # Error en parámetros
+    try:
+        user = await fetch_user("123")  # Provocará un error de validación
+        print("Usuario encontrado:", user)
+    except ValidationError as e:
+        print("Error de validación (\"123\"):", e)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ### Validación de Métodos
