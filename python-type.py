@@ -882,33 +882,63 @@ Value:     {repr(value)}""".strip()
         
         super().__setattr__(name, value)
 
-# NEW: Decorator for dataclass validation
-def validated_dataclass(*dataclass_args, **dataclass_kwargs):
+def validated_dataclass(cls=None, *dataclass_args, **dataclass_kwargs):
     """
     Decorator que combina @dataclass con validación automática de tipos.
     
-    Uso:
+    Usos soportados:
+        # Sin paréntesis (solo kwargs por defecto)
         @validated_dataclass
         class Person:
             name: str
             age: int
-            emails: List[str] = field(default_factory=list)
+        
+        # Con paréntesis vacíos
+        @validated_dataclass()
+        class Person:
+            name: str
+            age: int
+        
+        # Con argumentos nombrados
+        @validated_dataclass(frozen=True, order=True)
+        class Person:
+            name: str
+            age: int
+        
+        # Con argumentos posicionales y nombrados (como en código 1)
+        @validated_dataclass(True, True, frozen=True)  # init=True, repr=True, frozen=True
+        class Person:
+            name: str
+            age: int
     """
-    def decorator(cls):
-        # Crear una nueva clase que herede de DataclassValidationMixin
-        class ValidatedDataclass(DataclassValidationMixin, cls):
+    def wrap(base_cls):
+        # Aplicar @dataclass con todos los argumentos (posicionales y nombrados)
+        dataclass_base = dataclass(base_cls, *dataclass_args, **dataclass_kwargs)
+        
+        # Crear clase con herencia múltiple
+        class Validated(dataclass_base, DataclassValidationMixin):
             pass
         
-        # Copiar metadatos de la clase original
-        ValidatedDataclass.__name__ = cls.__name__
-        ValidatedDataclass.__qualname__ = cls.__qualname__
-        ValidatedDataclass.__module__ = cls.__module__
+        # Preservar metadatos de la clase original
+        Validated.__name__ = base_cls.__name__
+        Validated.__qualname__ = base_cls.__qualname__
+        Validated.__module__ = base_cls.__module__
         
-        # Aplicar el decorador @dataclass
-        return dataclass(*dataclass_args, **dataclass_kwargs)(ValidatedDataclass)
+        return Validated
     
-    return decorator
-
+    # Si cls es None, se llamó con paréntesis: @validated_dataclass() o @validated_dataclass(args...)
+    if cls is None:
+        return wrap
+    # Si cls no es None, se llamó sin paréntesis: @validated_dataclass
+    else:
+        # Verificar que no se pasaron argumentos posicionales cuando se usa sin paréntesis
+        if dataclass_args or dataclass_kwargs:
+            raise TypeError(
+                "Cannot use positional or keyword arguments when applying "
+                "@validated_dataclass directly to a class. Use @validated_dataclass() instead."
+            )
+        return wrap(cls)
+        
 import functools
 import inspect
 import asyncio
